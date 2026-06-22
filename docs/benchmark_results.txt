@@ -1,0 +1,10 @@
+Building + compiling MAX model...
+  graph build: 0.3s   compile: 237.0s
+
+PARITY  final-waveform max abs diff: 1.509e-04  (rel 4.65e-05)
+
+MAX (CPU) end-to-end:   1964.6 ± 41.6 ms   (NN core only: 2379.4 ms)
+torch (CPU) forward:    2000.7 ± 52.3 ms
+torch (MPS) forward:     406.6 ± 6.3 ms
+
+Speedup MAX-CPU vs torch-CPU: 1.02x
