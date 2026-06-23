@@ -1,4 +1,4 @@
-# demucs-mojo
+# demucs-max
 
 Reimplementation of **HTDemucs v4** (Hybrid Transformer Demucs, the default
 `htdemucs` music source-separation model) in **Modular MAX**, with a numerical
@@ -79,9 +79,9 @@ PYTHONPATH=ext/demucs:src uv run python scripts/e2e.py
 
 ## Next steps
 
-- Run on a GPU server (MAX GPU backend) — the native `conv2d_transpose`/`irfft`
+- Test the MAX GPU backend — native `conv2d_transpose`/`irfft`
   GPU kernels exist, so the workarounds above can be dropped and the full
-  pipeline (incl. STFT/iSTFT) moved in-graph.
+  pipeline (incl. STFT/iSTFT) moved in-graph. (apple silicon conv2d appears broken)
 - Cut compile time with runtime weights (`weights_registry`) instead of baked
   constants.
 - Optimize the spectral DConv (currently `B·Fr` tiny batched convs).
