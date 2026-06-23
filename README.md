@@ -63,6 +63,13 @@ MAX's CPU backend had several gaps that shaped the port:
 
 ## Running
 
+First download *demucs* to ext/demucs
+
+```bash
+mkdir ext
+git clone org-16943930@github.com:facebookresearch/demucs.git ext/demucs
+```
+
 Everything uses `uv` (Python 3.13). The pretrained checkpoint downloads on first
 model load.
 
