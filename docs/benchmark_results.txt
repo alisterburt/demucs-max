@@ -1,3 +1,4 @@
+=== CPU (Apple M4 Pro) ===
 Building + compiling MAX model...
   graph build: 0.3s   compile: 237.0s
 
@@ -8,3 +9,27 @@ torch (CPU) forward:    2000.7 ± 52.3 ms
 torch (MPS) forward:     406.6 ± 6.3 ms
 
 Speedup MAX-CPU vs torch-CPU: 1.02x
+
+
+=== GPU (NVIDIA A10, CUDA 13, MAX 26.x) ===
+Building + compiling MAX model...
+  graph build: 0.8s   compile: 217.4s   (cached on subsequent runs: ~0.6s)
+
+PARITY  final-waveform max abs diff: 4.048e-03  (rel 1.25e-03)
+  (looser than CPU's 4.6e-5, consistent with Ampere TF32 tensor-core matmuls)
+
+MAX (GPU) end-to-end:   2348.9 ± 9.1 ms   (NN core only: 2379.6 ms)
+torch (CPU) forward:     605.0 ± 33.1 ms
+torch (CUDA) forward:    121.7 ± 0.2 ms   [NVIDIA A10]
+
+Speedup MAX-GPU vs torch-CUDA: 0.05x   (i.e. ~19x SLOWER)
+Speedup MAX-GPU vs torch-CPU:  0.26x
+
+Diagnosis: GPU runs at 100% util / ~4.3 GB / 80-140 W during the core loop, so it
+is compute-bound, not idle or launch-bound. The graph still encodes the CPU-era
+workarounds, which are pathological on GPU: zero-inflated dilated conv kernels,
+input-dilated (zero-padded) transposed convs, 1x1-conv-as-matmul reshapes, and
+the spectral DConv's B*Fr=512 tiny per-frequency batched convs. The SMs stay busy
+computing mostly zeros instead of using native conv_transpose / dilated / depthwise
+kernels. Dropping the workarounds for native GPU ops is the path to closing the
+gap with torch-CUDA.
