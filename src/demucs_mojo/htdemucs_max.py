@@ -14,12 +14,15 @@ conv2d_transpose won't lower on CPU, so transposed convs use a dilate+conv trick
 from __future__ import annotations
 
 import math
+import os
 
 import numpy as np
 from max.dtype import DType
 from max.graph import DeviceRef, Graph, TensorType, ops
 
-DEV = DeviceRef.CPU()
+# Device selection: DEMUCS_MAX_DEVICE=cpu|gpu (default gpu).
+USE_GPU = os.environ.get("DEMUCS_MAX_DEVICE", "gpu").lower() == "gpu"
+DEV = DeviceRef.GPU() if USE_GPU else DeviceRef.CPU()
 NHEADS = 8
 
 

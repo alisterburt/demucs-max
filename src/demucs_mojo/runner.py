@@ -21,8 +21,13 @@ SOURCES = 4
 
 class MaxHTDemucs:
     def __init__(self, state_dict: dict[str, np.ndarray], length: int = 343980):
+        import os
         from max.engine import InferenceSession
-        from max.driver import CPU
+        from max.driver import CPU, Accelerator
+        use_gpu = os.environ.get("DEMUCS_MAX_DEVICE", "gpu").lower() == "gpu"
+        self.device = Accelerator() if use_gpu else CPU()
+        self.host = CPU()
+        self.device_label = "GPU" if use_gpu else "CPU"
         self.sd = state_dict
         self.length = length
         # derive graph input shapes from a dummy STFT
@@ -35,7 +40,7 @@ class MaxHTDemucs:
         g = build_core(state_dict, self.x_shape, self.xt_shape)
         self.build_s = time.time() - t0
         t0 = time.time()
-        self.model = InferenceSession(devices=[CPU()]).load(g)
+        self.model = InferenceSession(devices=[self.device]).load(g)
         self.compile_s = time.time() - t0
 
     def _pre(self, mix: torch.Tensor):
@@ -64,12 +69,17 @@ class MaxHTDemucs:
         if length != self.length:
             mix = torch.nn.functional.pad(mix, (0, self.length - length))
         z, x_norm, mean, std, xt_norm, meant, stdt = self._pre(mix)
+        from max.driver import Buffer
+        x_buf = Buffer.from_numpy(x_norm.numpy().astype(np.float32)).to(self.device)
+        xt_buf = Buffer.from_numpy(xt_norm.numpy().astype(np.float32)).to(self.device)
         t0 = time.time()
-        out = self.model.execute(x_norm.numpy().astype(np.float32),
-                                 xt_norm.numpy().astype(np.float32))
+        out = self.model.execute(x_buf, xt_buf)
+        # .to(host).to_numpy() forces the device->host copy, which synchronizes the
+        # GPU so the timing reflects real compute (execute() returns asynchronously).
+        x_pre = out[0].to(self.host).to_numpy()
+        xt_pre = out[1].to(self.host).to_numpy()
         if timing is not None:
             timing["core_s"] = time.time() - t0
-        x_pre, xt_pre = out[0].to_numpy(), out[1].to_numpy()
         y = self._post(z, x_pre, mean, std, xt_pre, meant, stdt, self.length)
         return y[..., :length]
 

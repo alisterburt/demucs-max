@@ -48,8 +48,9 @@ def main():
     print(f"\nPARITY  final-waveform max abs diff: {diff:.3e}  (rel {rel:.2e})")
 
     # ---- benchmark MAX ----
+    dev = m.device_label
     tmax = bench(lambda: m.separate(mix))
-    print(f"\nMAX (CPU) end-to-end:  {tmax.mean()*1e3:7.1f} ± {tmax.std()*1e3:.1f} ms"
+    print(f"\nMAX ({dev}) end-to-end:  {tmax.mean()*1e3:7.1f} ± {tmax.std()*1e3:.1f} ms"
           f"   (NN core only: {timing['core_s']*1e3:.1f} ms)")
 
     # ---- benchmark torch ----
@@ -60,17 +61,22 @@ def main():
         ttorch_cpu = bench(lambda: sub(mix))
     print(f"torch (CPU) forward:   {ttorch_cpu.mean()*1e3:7.1f} ± {ttorch_cpu.std()*1e3:.1f} ms")
 
-    # torch MPS
-    try:
-        sub_mps = sub.to("mps")
-        mix_mps = mix.to("mps")
+    # torch CUDA
+    if torch.cuda.is_available():
+        sub_cuda = sub.to("cuda")
+        mix_cuda = mix.to("cuda")
+        def run_cuda():
+            sub_cuda(mix_cuda)
+            torch.cuda.synchronize()
         with torch.no_grad():
-            tmps = bench(lambda: torch.mps.synchronize() or sub_mps(mix_mps))
-        print(f"torch (MPS) forward:   {tmps.mean()*1e3:7.1f} ± {tmps.std()*1e3:.1f} ms")
-    except Exception as e:  # noqa: BLE001
-        print("torch MPS failed:", repr(e)[:120])
+            tcuda = bench(run_cuda)
+        name = torch.cuda.get_device_name(0)
+        print(f"torch (CUDA) forward:  {tcuda.mean()*1e3:7.1f} ± {tcuda.std()*1e3:.1f} ms   [{name}]")
+        print(f"\nSpeedup MAX-{dev} vs torch-CUDA: {tcuda.mean()/tmax.mean():.2f}x")
+    else:
+        print("torch CUDA not available")
 
-    print(f"\nSpeedup MAX-CPU vs torch-CPU: {ttorch_cpu.mean()/tmax.mean():.2f}x")
+    print(f"Speedup MAX-{dev} vs torch-CPU:  {ttorch_cpu.mean()/tmax.mean():.2f}x")
 
 
 if __name__ == "__main__":
