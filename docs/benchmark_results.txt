@@ -31,5 +31,35 @@ workarounds, which are pathological on GPU: zero-inflated dilated conv kernels,
 input-dilated (zero-padded) transposed convs, 1x1-conv-as-matmul reshapes, and
 the spectral DConv's B*Fr=512 tiny per-frequency batched convs. The SMs stay busy
 computing mostly zeros instead of using native conv_transpose / dilated / depthwise
-kernels. Dropping the workarounds for native GPU ops is the path to closing the
-gap with torch-CUDA.
+kernels.
+
+NOTE: native ops.conv2d_transpose does NOT work on this stack -- it hard-aborts
+with "ABORT: invalid cudnnStatus_t entry" (CUDA 13 / cuDNN 9.20, likely a
+cuDNN version-skew in MAX 26.2). See docs/cudnn_convT_issue.md. So the transposed
+conv had to be reformulated WITHOUT the native op.
+
+
+=== GPU (A10) after sub-pixel transposed-conv reformulation ===
+Replaced the input-dilated transposed convs with a stride-1 conv2d that produces
+Cout*stride channels, then a pixel-shuffle of those channels into the spatial axis
+(standard sub-pixel / "pixel shuffle" equivalence; needs kernel % stride == 0,
+true here: k=8, s=4). Uses only the working conv2d op; ~4x fewer MACs in the
+transposed convs; numerically exact vs the old workaround (parity unchanged).
+
+PARITY  final-waveform max abs diff: 4.048e-03  (rel 1.25e-03)   [identical]
+
+MAX (GPU) end-to-end:   1914.7 ± 2.6 ms   (was 2348.9; -18%)
+torch (CUDA) forward:    121.5 ± 0.3 ms
+
+Section profile (random inputs, real shapes):
+                     before convT fix     after
+  ENCODER section:        511 ms          512 ms
+  TRANSFORMER section:    114 ms          113 ms
+  DECODER section:       1691 ms         1255 ms   <- all the win landed here
+    (freq decoder 904 ms, time decoder 333 ms)
+
+Remaining bottleneck: the per-frequency spectral DConv (the B*Fr batch-fold),
+which dominates both the freq decoder (904 ms) and the encoder (512 ms). The fold
+exists because the DConv's GroupNorm normalizes each frequency independently;
+making it fold-free (conv with a (1,k) kernel directly over (B,C,Fr,T) + a
+per-frequency groupnorm) is the next lever, but is a parity-sensitive change.
