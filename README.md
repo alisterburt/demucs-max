@@ -27,19 +27,26 @@ MAX caches the compiled graph, so subsequent runs start in <1 s.
 
 ### Benchmark — GPU (NVIDIA A10, CUDA 13)
 
-| backend | latency |
-|---|---|
-| MAX (GPU) — initial port | 2349 ± 9 ms |
-| **MAX (GPU) — after sub-pixel convT** | **1915 ± 3 ms** |
-| torch (CPU) | 566 ± 30 ms |
-| torch (CUDA, A10) | **122 ± 0.3 ms** |
+| backend | latency | parity (rel) |
+|---|---|---|
+| MAX (GPU) — initial port | 2349 ± 9 ms | 1.25e-3 |
+| MAX (GPU) — after sub-pixel convT | 1915 ± 3 ms | 1.25e-3 |
+| **MAX (GPU) — bf16 convs** (`DEMUCS_MAX_CONV_DTYPE=bf16`) | **1482 ± 4 ms** | 1.56e-2 |
+| torch (CPU) | 525 ± 19 ms | — |
+| torch (CUDA, A10) | **122 ± 0.3 ms** | — |
 
-Parity on GPU is rel 1.25e-3 (looser than CPU, consistent with Ampere TF32
-matmuls — inaudible). The port runs correctly but is still ~16× slower than
-torch-CUDA: the CPU-era workarounds are GPU-hostile. The transposed convs have
-been reformulated as a sub-pixel (pixel-shuffle) `conv2d` (−18% end-to-end, exact
-parity); the remaining hotspot is the per-frequency spectral DConv. See
-`docs/benchmark_results.txt` for the section-by-section profile.
+The port runs correctly on GPU (parity rel 1.25e-3, consistent with Ampere TF32
+matmuls — inaudible) but is ~16× slower than torch-CUDA. Two graph-level wins
+landed: the transposed convs were reformulated as a sub-pixel (pixel-shuffle)
+`conv2d` (−18%, exact parity), and an opt-in bf16 conv mode (−23% more, but
+parity drops to rel 1.6e-2).
+
+**The residual gap is inside MAX, not the port.** Profiling traces it to MAX's
+fp32 `conv2d` GPU kernel, which sustains only ~30 GMAC/s (~0.1% of the A10's fp32
+peak) on every shape tested — it does not appear to use cuDNN/tensor cores, while
+torch's 122 ms is exactly cuDNN doing so. See `docs/benchmark_results.txt` for the
+full profile and `docs/conv2d_perf_issue.md` / `docs/cudnn_convT_issue.md` for the
+two MAX issues this surfaced.
 
 ## How it's structured
 
@@ -105,12 +112,15 @@ PYTHONPATH=ext/demucs:src uv run python scripts/e2e.py
 
 ## Next steps
 
-- **Close the GPU gap with torch-CUDA (~16×).** The biggest remaining cost is the
-  per-frequency spectral DConv: the `(B,C,Fr,T)→(B·Fr,C,T)` fold makes the freq
-  decoder 904 ms and the encoder 512 ms. Making it fold-free (a `(1,k)` conv
-  directly over `(B,C,Fr,T)` + a per-frequency group-norm) is the next lever.
+- **Close the GPU gap with torch-CUDA (~16×).** Root-caused to MAX's slow fp32
+  `conv2d` GPU kernel (~0.1% of peak, no cuDNN/tensor cores) — see
+  `docs/conv2d_perf_issue.md`. This is a MAX-internal fix; graph-level
+  reformulation can't close it (verified: the convs are already the minimal
+  formulation, and un-folding the DConv was *slower*). bf16 convs recover ~23%
+  but cost accuracy.
 - Move the STFT/iSTFT in-graph with native `irfft` (currently in torch).
 - Cut compile time with runtime weights (`weights_registry`) instead of baked
   constants.
 - `conv2d_transpose` aborts on GPU (cuDNN status-enum skew) — see
-  `docs/cudnn_convT_issue.md`; filed so it can be dropped once fixed upstream.
+  `docs/cudnn_convT_issue.md`; can be dropped once fixed upstream (though the
+  sub-pixel `conv2d` form is competitive anyway).

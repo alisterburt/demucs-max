@@ -25,6 +25,20 @@ USE_GPU = os.environ.get("DEMUCS_MAX_DEVICE", "gpu").lower() == "gpu"
 DEV = DeviceRef.GPU() if USE_GPU else DeviceRef.CPU()
 NHEADS = 8
 
+# Optional low-precision conv compute: DEMUCS_MAX_CONV_DTYPE=fp32|bf16 (default fp32).
+# MAX's fp32 conv2d GPU kernel is very slow (~30 GMAC/s); bf16 is ~3-4x faster at
+# the cost of accuracy. Only the conv compute is affected; everything else stays fp32.
+CONV_DTYPE = {"bf16": DType.bfloat16, "fp32": DType.float32}[
+    os.environ.get("DEMUCS_MAX_CONV_DTYPE", "fp32").lower()]
+
+
+def _conv2d(x, filt, **kw):
+    """ops.conv2d, optionally in bf16 (cast in, cast result back to fp32)."""
+    if CONV_DTYPE != DType.float32:
+        y = ops.conv2d(ops.cast(x, CONV_DTYPE), ops.cast(filt, CONV_DTYPE), **kw)
+        return ops.cast(y, DType.float32)
+    return ops.conv2d(x, filt, **kw)
+
 
 # ------------------------------- weight helpers ----------------------------
 class Builder:
@@ -80,7 +94,7 @@ def conv2d_t(bd: Builder, x, w_key, b_key, stride, pad):
     O = w.shape[0]
     wr = np.transpose(w, (2, 3, 1, 0))                # RSCF (kH,kW,I,O)
     xt = ops.permute(x, [0, 2, 3, 1])                 # NHWC
-    y = ops.conv2d(xt, bd.const(wr), stride=stride,
+    y = _conv2d(xt, bd.const(wr), stride=stride,
                    padding=(pad[0], pad[0], pad[1], pad[1]))
     bias = bd.k(b_key).reshape(1, 1, 1, O)
     y = y + bd.const(bias)
@@ -120,7 +134,7 @@ def conv1d_t(bd: Builder, x, w_key, b_key, stride, pad, dilation=1):
     O = w.shape[0]
     wr = np.transpose(w[:, :, None, :], (2, 3, 1, 0))  # (1,k,I,O)
     xt = ops.permute(x4, [0, 2, 3, 1])                 # NHWC (N,1,L,C)
-    y = ops.conv2d(xt, bd.const(wr), stride=(1, stride),
+    y = _conv2d(xt, bd.const(wr), stride=(1, stride),
                    padding=(0, 0, pad, pad))
     y = y + bd.const(bd.k(b_key).reshape(1, 1, 1, O))
     y = ops.permute(y, [0, 3, 1, 2])                   # (N,O,1,Lout)
@@ -152,7 +166,7 @@ def conv_transpose_1axis(bd: Builder, x, w_key, b_key, stride):
     N, _, L = [int(d) for d in x.shape]
     x4 = ops.unsqueeze(x, 3)                              # (N,C,L,1)
     xt = ops.permute(x4, [0, 2, 3, 1])                    # (N,L,1,C) NHWC, L on H
-    y = ops.conv2d(xt, bd.const(filt), stride=(1, 1),
+    y = _conv2d(xt, bd.const(filt), stride=(1, 1),
                    padding=(tk - 1, tk - 1, 0, 0))        # (N,M,1,Cout*s)
     M = L + tk - 1
     y = ops.reshape(y, (N, M, Cout, stride))
@@ -170,7 +184,7 @@ def conv_transpose_freq(bd: Builder, x, w_key, b_key, stride_h):
     filt, tk = _subpixel_filter(w, stride_h)
     N, _, Fr, T = [int(d) for d in x.shape]
     xt = ops.permute(x, [0, 2, 3, 1])                     # (N,Fr,T,C) NHWC
-    y = ops.conv2d(xt, bd.const(filt), stride=(1, 1),
+    y = _conv2d(xt, bd.const(filt), stride=(1, 1),
                    padding=(tk - 1, tk - 1, 0, 0))        # (N,M,T,Cout*s)
     M = Fr + tk - 1
     y = ops.reshape(y, (N, M, T, Cout, stride_h))

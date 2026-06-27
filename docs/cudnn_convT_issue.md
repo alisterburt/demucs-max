@@ -84,8 +84,17 @@ as the equivalent `conv2d` does.
   2. Confirm the supported cuDNN/CUDA matrix for MAX 26.2 — is CUDA 13 /
      cuDNN 9.20 supported for `conv2d_transpose`, and if not, what is?
 
-## Workaround
+## Workaround (and a note on whether the native op is even preferable)
 
 We reformulated the transposed convolution as a stride-1 `conv2d` plus a
-channel→space ("pixel shuffle" / sub-pixel) reshape, which uses only the working
-`conv2d` op and avoids `conv2d_transpose` entirely.
+channel→space ("pixel shuffle" / sub-pixel) reshape, which uses only `conv2d` and
+avoids `conv2d_transpose` entirely.
+
+This is not just a stopgap: for our config (stride 4 divides kernel 8) the
+sub-pixel form is *exact and overlap-free* and collapses to a dense stride-1
+conv with a 2-tap kernel — the best-optimized conv path, no wasted compute. A
+native `conv2d_transpose` is often implemented as the (slower) conv-dgrad
+algorithm, so it would not necessarily be faster; its main advantage would be
+saving the one output reshape and handling the `kernel % stride != 0` case
+cleanly. So fixing this bug is mostly about correctness/debuggability, not a large
+perf gain for this model.

@@ -58,8 +58,45 @@ Section profile (random inputs, real shapes):
   DECODER section:       1691 ms         1255 ms   <- all the win landed here
     (freq decoder 904 ms, time decoder 333 ms)
 
-Remaining bottleneck: the per-frequency spectral DConv (the B*Fr batch-fold),
-which dominates both the freq decoder (904 ms) and the encoder (512 ms). The fold
-exists because the DConv's GroupNorm normalizes each frequency independently;
-making it fold-free (conv with a (1,k) kernel directly over (B,C,Fr,T) + a
-per-frequency groupnorm) is the next lever, but is a parity-sensitive change.
+Remaining bottleneck: see the root-cause section below. (Spoiler: it is NOT the
+DConv but the 3x3 "rewrite" conv2d, and ultimately MAX's slow fp32 conv kernel.)
+
+
+=== GPU (A10): root-cause profiling + bf16 conv mode ===
+
+Section profile after the sub-pixel convT fix (random inputs, real shapes):
+  ENCODER       512 ms
+  TRANSFORMER   113 ms
+  DECODER      1255 ms   (freq decoder 904 ms, time decoder 333 ms)
+
+Drilling into the freq decoder: the cost is NOT the per-frequency DConv (a full
+DConv on the largest shape is ~8 ms). It is the 3x3 "rewrite" conv2d: ~7.1 GMAC
+per decoder layer x4. Tried making the DConv fold-free (a (1,k) conv over
+(B,C,Fr,T) + per-frequency group-norm): numerically exact but 3x SLOWER
+(25 ms vs 8 ms) -- the B*Fr batch-fold is the GPU-friendly layout. Abandoned.
+
+Root cause of the residual gap = MAX's fp32 conv2d GPU kernel throughput:
+
+  fp32 conv2d throughput (bare op, no permutes), A10:
+    rewrite d3 (48->96  @512x336):  218 ms   33 GMAC/s
+    rewrite d0 (384->768 @8x336):   225 ms   32 GMAC/s
+    nice      (256->256 @64x64):     96 ms   25 GMAC/s
+    nice      (512->512 @32x32):    378 ms    6 GMAC/s
+  bf16:
+    rewrite d3 (48->96  @512x336):   59 ms  122 GMAC/s  (3.7x)
+
+~30 GMAC/s in fp32 is ~0.1% of the A10's fp32 peak -- the kernel is not using
+cuDNN / tensor cores (consistent with conv2d_transpose being the only path that
+hits cuDNN, and aborting). This is a MAX-internal limitation, not a property of
+the port; graph-level reformulation can't fix it. See docs/conv2d_perf_issue.md.
+
+Optional bf16 conv mode (DEMUCS_MAX_CONV_DTYPE=bf16, default fp32):
+
+  | mode              | end-to-end | parity (rel) |
+  |-------------------|-----------:|-------------:|
+  | fp32 (default)    |    1915 ms |     1.25e-3  |
+  | bf16 convs        |    1482 ms |     1.56e-2  |
+  | torch (CUDA)      |     122 ms |       --     |
+
+bf16 buys ~23% but costs ~1 order of magnitude of accuracy (rel 1.6e-2, ~ -36 dB
+on the waveform). Only the conv compute is cast; matmuls/attention stay fp32.
