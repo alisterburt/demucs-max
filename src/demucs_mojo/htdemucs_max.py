@@ -25,6 +25,20 @@ USE_GPU = os.environ.get("DEMUCS_MAX_DEVICE", "gpu").lower() == "gpu"
 DEV = DeviceRef.GPU() if USE_GPU else DeviceRef.CPU()
 NHEADS = 8
 
+# Optional low-precision conv compute: DEMUCS_MAX_CONV_DTYPE=fp32|bf16 (default fp32).
+# MAX's fp32 conv2d GPU kernel is very slow (~30 GMAC/s); bf16 is ~3-4x faster at
+# the cost of accuracy. Only the conv compute is affected; everything else stays fp32.
+CONV_DTYPE = {"bf16": DType.bfloat16, "fp32": DType.float32}[
+    os.environ.get("DEMUCS_MAX_CONV_DTYPE", "fp32").lower()]
+
+
+def _conv2d(x, filt, **kw):
+    """ops.conv2d, optionally in bf16 (cast in, cast result back to fp32)."""
+    if CONV_DTYPE != DType.float32:
+        y = ops.conv2d(ops.cast(x, CONV_DTYPE), ops.cast(filt, CONV_DTYPE), **kw)
+        return ops.cast(y, DType.float32)
+    return ops.conv2d(x, filt, **kw)
+
 
 # ------------------------------- weight helpers ----------------------------
 class Builder:
@@ -80,7 +94,7 @@ def conv2d_t(bd: Builder, x, w_key, b_key, stride, pad):
     O = w.shape[0]
     wr = np.transpose(w, (2, 3, 1, 0))                # RSCF (kH,kW,I,O)
     xt = ops.permute(x, [0, 2, 3, 1])                 # NHWC
-    y = ops.conv2d(xt, bd.const(wr), stride=stride,
+    y = _conv2d(xt, bd.const(wr), stride=stride,
                    padding=(pad[0], pad[0], pad[1], pad[1]))
     bias = bd.k(b_key).reshape(1, 1, 1, O)
     y = y + bd.const(bias)
@@ -120,53 +134,63 @@ def conv1d_t(bd: Builder, x, w_key, b_key, stride, pad, dilation=1):
     O = w.shape[0]
     wr = np.transpose(w[:, :, None, :], (2, 3, 1, 0))  # (1,k,I,O)
     xt = ops.permute(x4, [0, 2, 3, 1])                 # NHWC (N,1,L,C)
-    y = ops.conv2d(xt, bd.const(wr), stride=(1, stride),
+    y = _conv2d(xt, bd.const(wr), stride=(1, stride),
                    padding=(0, 0, pad, pad))
     y = y + bd.const(bd.k(b_key).reshape(1, 1, 1, O))
     y = ops.permute(y, [0, 3, 1, 2])                   # (N,O,1,Lout)
     return ops.squeeze(y, 2)
 
 
+def _subpixel_filter(w, s):
+    """ConvTranspose weight (Cin,Cout,k) -> conv2d RSCF filter (tk,1,Cin,Cout*s)
+    for the sub-pixel (pixel-shuffle) equivalent of a stride-s transposed conv.
+    Requires k % s == 0 (true for htdemucs: k=8, s=4)."""
+    Cin, Cout, k = w.shape
+    assert k % s == 0, f"sub-pixel convT needs k({k}) divisible by stride({s})"
+    tk = k // s
+    Wr = w.reshape(Cin, Cout, tk, s)             # [c,o,a,r] = w[c,o,a*s+r]
+    Kf = Wr[:, :, ::-1, :]                        # reverse tap axis (cross-correlation)
+    Kf = np.transpose(Kf, (2, 0, 1, 3))          # (tk, Cin, Cout, s)
+    Kf = Kf.reshape(tk, Cin, Cout * s)           # out-channel index = o*s + r
+    return np.ascontiguousarray(Kf[:, None, :, :]), tk  # RSCF (tk,1,Cin,Cout*s)
+
+
 def conv_transpose_1axis(bd: Builder, x, w_key, b_key, stride):
-    """ConvTranspose1d over (N,C,L) via dilate + flipped conv. w (Cin,Cout,k).
-    The conv is oriented along the H axis with a (k,1) kernel — MAX's CPU conv2d
-    mishandles wide (1,k) multichannel kernels, so we keep the spatial dim on H."""
+    """ConvTranspose1d over (N,C,L), padding 0. Sub-pixel form: a stride-1 conv2d
+    producing Cout*stride channels, then a pixel-shuffle of those channels into
+    the length axis. Avoids conv2d_transpose (aborts on GPU via cuDNN) and the old
+    4x zero-inflation. Kernel stays on the H axis (MAX mishandles wide (1,k) convs)."""
     w = bd.k(w_key)
     Cin, Cout, k = w.shape
-    shp = [int(d) for d in x.shape]
-    N, C, L = shp
-    # to NHWC with L on H: (N,C,L) -> (N,C,L,1) -> (N,L,1,C)
-    x4 = ops.unsqueeze(x, 3)
-    xt = ops.permute(x4, [0, 2, 3, 1])                    # (N,L,1,C)
-    # dilate along H: (N,L,1,C) -> (N,L,1,1,C) pad-> (N,L,stride,1,C) -> (N,L*stride,1,C)
-    xe = ops.unsqueeze(xt, 2)
-    xe = ops.pad(xe, [0, 0, 0, 0, 0, stride - 1, 0, 0, 0, 0])
-    xe = ops.reshape(xe, (N, L * stride, 1, C))
-    if stride > 1:
-        xe = xe[:, : (L - 1) * stride + 1, :, :]
-    # conv: kernel (k,1), pad H by k-1, weight flipped along k & swapped to (Cout,Cin,k)
-    wf = np.transpose(w[:, :, ::-1], (1, 0, 2)).copy()    # (Cout,Cin,k)
-    wr = np.transpose(wf[:, :, :, None], (2, 3, 1, 0))    # (k,1,Cin,Cout)
-    y = ops.conv2d(xe, bd.const(wr), stride=(1, 1), padding=(k - 1, k - 1, 0, 0))
-    y = y + bd.const(bd.k(b_key).reshape(1, 1, 1, Cout))
-    y = ops.permute(y, [0, 3, 1, 2])                      # (N,Cout,Hout,1)
-    return ops.squeeze(y, 3)                              # (N,Cout,(L-1)*stride+k)
+    filt, tk = _subpixel_filter(w, stride)
+    N, _, L = [int(d) for d in x.shape]
+    x4 = ops.unsqueeze(x, 3)                              # (N,C,L,1)
+    xt = ops.permute(x4, [0, 2, 3, 1])                    # (N,L,1,C) NHWC, L on H
+    y = _conv2d(xt, bd.const(filt), stride=(1, 1),
+                   padding=(tk - 1, tk - 1, 0, 0))        # (N,M,1,Cout*s)
+    M = L + tk - 1
+    y = ops.reshape(y, (N, M, Cout, stride))
+    y = ops.permute(y, [0, 2, 1, 3])                      # (N,Cout,M,s)
+    y = ops.reshape(y, (N, Cout, M * stride))             # pixel-shuffle (r fastest)
+    return y + bd.const(bd.k(b_key).reshape(1, Cout, 1))  # out: (N,Cout,(L-1)*s+k)
 
 
 def conv_transpose_freq(bd: Builder, x, w_key, b_key, stride_h):
     """ConvTranspose2d for freq branch: kernel (kH,1) stride (stride_h,1) on
-    (N,C,Fr,T). T is independent (kernel W=1) -> fold T into batch, do 1D along Fr."""
-    shp = [int(d) for d in x.shape]
-    N, C, Fr, T = shp
-    # weight (Cin,Cout,kH,1) -> drop trailing 1 -> (Cin,Cout,kH)
-    w = bd.k(w_key)
-    bd.sd["__tmp_wfreq"] = w[:, :, :, 0]
-    xr = ops.permute(x, [0, 3, 1, 2])                     # (N,T,C,Fr)
-    xr = ops.reshape(xr, (N * T, C, Fr))
-    y = conv_transpose_1axis(bd, xr, "__tmp_wfreq", b_key, stride_h)
-    Fout = int(y.shape[-1])
-    y = ops.reshape(y, (N, T, w.shape[1], Fout))
-    return ops.permute(y, [0, 2, 3, 1])                   # (N,Cout,Fout,T)
+    (N,C,Fr,T). T is independent (kernel W=1) -> sub-pixel along Fr, T untouched."""
+    w4 = bd.k(w_key)                                      # (Cin,Cout,kH,1)
+    w = w4[:, :, :, 0]
+    Cout = w.shape[1]
+    filt, tk = _subpixel_filter(w, stride_h)
+    N, _, Fr, T = [int(d) for d in x.shape]
+    xt = ops.permute(x, [0, 2, 3, 1])                     # (N,Fr,T,C) NHWC
+    y = _conv2d(xt, bd.const(filt), stride=(1, 1),
+                   padding=(tk - 1, tk - 1, 0, 0))        # (N,M,T,Cout*s)
+    M = Fr + tk - 1
+    y = ops.reshape(y, (N, M, T, Cout, stride_h))
+    y = ops.permute(y, [0, 3, 1, 4, 2])                   # (N,Cout,M,s,T)
+    y = ops.reshape(y, (N, Cout, M * stride_h, T))        # pixel-shuffle along Fr
+    return y + bd.const(bd.k(b_key).reshape(1, Cout, 1, 1))  # (N,Cout,Fout,T)
 
 
 # ------------------------------- DConv -------------------------------------

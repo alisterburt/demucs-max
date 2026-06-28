@@ -31,5 +31,72 @@ workarounds, which are pathological on GPU: zero-inflated dilated conv kernels,
 input-dilated (zero-padded) transposed convs, 1x1-conv-as-matmul reshapes, and
 the spectral DConv's B*Fr=512 tiny per-frequency batched convs. The SMs stay busy
 computing mostly zeros instead of using native conv_transpose / dilated / depthwise
-kernels. Dropping the workarounds for native GPU ops is the path to closing the
-gap with torch-CUDA.
+kernels.
+
+NOTE: native ops.conv2d_transpose does NOT work on this stack -- it hard-aborts
+with "ABORT: invalid cudnnStatus_t entry" (CUDA 13 / cuDNN 9.20, likely a
+cuDNN version-skew in MAX 26.2). See docs/cudnn_convT_issue.md. So the transposed
+conv had to be reformulated WITHOUT the native op.
+
+
+=== GPU (A10) after sub-pixel transposed-conv reformulation ===
+Replaced the input-dilated transposed convs with a stride-1 conv2d that produces
+Cout*stride channels, then a pixel-shuffle of those channels into the spatial axis
+(standard sub-pixel / "pixel shuffle" equivalence; needs kernel % stride == 0,
+true here: k=8, s=4). Uses only the working conv2d op; ~4x fewer MACs in the
+transposed convs; numerically exact vs the old workaround (parity unchanged).
+
+PARITY  final-waveform max abs diff: 4.048e-03  (rel 1.25e-03)   [identical]
+
+MAX (GPU) end-to-end:   1914.7 ± 2.6 ms   (was 2348.9; -18%)
+torch (CUDA) forward:    121.5 ± 0.3 ms
+
+Section profile (random inputs, real shapes):
+                     before convT fix     after
+  ENCODER section:        511 ms          512 ms
+  TRANSFORMER section:    114 ms          113 ms
+  DECODER section:       1691 ms         1255 ms   <- all the win landed here
+    (freq decoder 904 ms, time decoder 333 ms)
+
+Remaining bottleneck: see the root-cause section below. (Spoiler: it is NOT the
+DConv but the 3x3 "rewrite" conv2d, and ultimately MAX's slow fp32 conv kernel.)
+
+
+=== GPU (A10): root-cause profiling + bf16 conv mode ===
+
+Section profile after the sub-pixel convT fix (random inputs, real shapes):
+  ENCODER       512 ms
+  TRANSFORMER   113 ms
+  DECODER      1255 ms   (freq decoder 904 ms, time decoder 333 ms)
+
+Drilling into the freq decoder: the cost is NOT the per-frequency DConv (a full
+DConv on the largest shape is ~8 ms). It is the 3x3 "rewrite" conv2d: ~7.1 GMAC
+per decoder layer x4. Tried making the DConv fold-free (a (1,k) conv over
+(B,C,Fr,T) + per-frequency group-norm): numerically exact but 3x SLOWER
+(25 ms vs 8 ms) -- the B*Fr batch-fold is the GPU-friendly layout. Abandoned.
+
+Root cause of the residual gap = MAX's fp32 conv2d GPU kernel throughput:
+
+  fp32 conv2d throughput (bare op, no permutes), A10:
+    rewrite d3 (48->96  @512x336):  218 ms   33 GMAC/s
+    rewrite d0 (384->768 @8x336):   225 ms   32 GMAC/s
+    nice      (256->256 @64x64):     96 ms   25 GMAC/s
+    nice      (512->512 @32x32):    378 ms    6 GMAC/s
+  bf16:
+    rewrite d3 (48->96  @512x336):   59 ms  122 GMAC/s  (3.7x)
+
+~30 GMAC/s in fp32 is ~0.1% of the A10's fp32 peak -- the kernel is not using
+cuDNN / tensor cores (consistent with conv2d_transpose being the only path that
+hits cuDNN, and aborting). This is a MAX-internal limitation, not a property of
+the port; graph-level reformulation can't fix it. See docs/conv2d_perf_issue.md.
+
+Optional bf16 conv mode (DEMUCS_MAX_CONV_DTYPE=bf16, default fp32):
+
+  | mode              | end-to-end | parity (rel) |
+  |-------------------|-----------:|-------------:|
+  | fp32 (default)    |    1915 ms |     1.25e-3  |
+  | bf16 convs        |    1482 ms |     1.56e-2  |
+  | torch (CUDA)      |     122 ms |       --     |
+
+bf16 buys ~23% but costs ~1 order of magnitude of accuracy (rel 1.6e-2, ~ -36 dB
+on the waveform). Only the conv compute is cast; matmuls/attention stay fp32.
